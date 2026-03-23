@@ -1,5 +1,6 @@
-环境安装 mamba env create -f environment_mmpose.yml
-
+环境安装 mamba env create -f environment_mmpose.yml  
+ 
+mim install "mmpose>=1.1.0"
 验证安装使用mim download mmpose --config td-hm_hrnet-w48_8xb32-210e_coco-256x192  --dest . 
     python demo/image_demo.py \
     tests/data/coco/000000000785.jpg \

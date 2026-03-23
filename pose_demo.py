@@ -49,6 +49,77 @@ def make_transparent_png(bgr_image: np.ndarray) -> np.ndarray:
     bgra_image = cv2.merge((b, g, r, alpha))
     return bgra_image
 
+def get_box_area(person_data: dict) -> float:
+    """计算单个边界框的几何面积，用于在极端视角中准确筛选出占幅最大的主角人物"""
+    bbox_list = person_data.get('bbox', [])
+    if not bbox_list:
+        return 0.0
+    bbox = bbox_list[0] if isinstance(bbox_list[0], (list, tuple, np.ndarray)) else bbox_list
+    if len(bbox) < 4:
+        return 0.0
+    return float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+
+
+# COCO 17关键点标准连线对（左侧橙色，右侧绿色，中轴蓝色）
+COCO_SKELETON = [
+    (0,  1,  (255, 128,   0)),  # 鼻 - 左眼
+    (0,  2,  (255, 128,   0)),  # 鼻 - 右眼
+    (1,  3,  (255, 128,   0)),  # 左眼 - 左耳
+    (2,  4,  (255, 128,   0)),  # 右眼 - 右耳
+    (3,  5,  (255, 128,   0)),  # 左耳 - 左肩（头身连接）
+    (4,  6,  (255, 128,   0)),  # 右耳 - 右肩（头身连接）
+    (5,  6,  (  0, 128, 255)),  # 左肩 - 右肩
+    (5,  7,  (  0, 255,   0)),  # 左肩 - 左肘
+    (7,  9,  (  0, 255,   0)),  # 左肘 - 左手
+    (6,  8,  (255, 128,   0)),  # 右肩 - 右肘
+    (8, 10,  (255, 128,   0)),  # 右肘 - 右手
+    (5, 11,  (  0, 128, 255)),  # 左肩 - 左髋
+    (6, 12,  (  0, 128, 255)),  # 右肩 - 右髋
+    (11,12,  (  0, 128, 255)),  # 左髋 - 右髋
+    (11,13,  (  0, 255,   0)),  # 左髋 - 左膝
+    (13,15,  (  0, 255,   0)),  # 左膝 - 左踝
+    (12,14,  (255, 128,   0)),  # 右髋 - 右膝
+    (14,16,  (255, 128,   0)),  # 右膝 - 右踝
+]
+
+
+def draw_skeleton_on_image(img_bgr: np.ndarray, person_data: dict, black_bg: bool) -> np.ndarray:
+    """在图像上手工绘制单人骨架，完全不依赖 MMPose 渲染器。"""
+    if black_bg:
+        canvas = np.zeros_like(img_bgr)
+    else:
+        canvas = img_bgr.copy()
+
+    kpts   = person_data.get('keypoints', [])
+    scores = person_data.get('keypoint_scores', [])
+
+    # 绘制骨骼连线
+    for (i, j, color) in COCO_SKELETON:
+        if i >= len(kpts) or j >= len(kpts):
+            continue
+        si = scores[i] if i < len(scores) else 0.0
+        sj = scores[j] if j < len(scores) else 0.0
+        if si < 0.1 or sj < 0.1:
+            continue
+        xi, yi = int(kpts[i][0]), int(kpts[i][1])
+        xj, yj = int(kpts[j][0]), int(kpts[j][1])
+        cv2.line(canvas, (xi, yi), (xj, yj), color, 2, cv2.LINE_AA)
+
+    # 绘制关键点圆点
+    kpt_colors = [
+        (255,128,0),(255,128,0),(255,128,0),(255,128,0),(255,128,0),  # 0-4
+        (0,255,0),(255,128,0),(0,255,0),(255,128,0),(0,255,0),(255,128,0),  # 5-10
+        (0,255,0),(255,128,0),(0,255,0),(255,128,0),(0,255,0),(255,128,0),  # 11-16
+    ]
+    for i, (x, y) in enumerate(kpts):
+        s = scores[i] if i < len(scores) else 0.0
+        if s < 0.1:
+            continue
+        color = kpt_colors[i] if i < len(kpt_colors) else (0, 255, 255)
+        cv2.circle(canvas, (int(x), int(y)), 4, color, -1, cv2.LINE_AA)
+
+    return canvas
+
 # ==========================================
 # 2. 核心特征处理：直接内存运算替代磁盘读取
 # ==========================================
@@ -71,8 +142,8 @@ def extract_and_save_txt(predictions: list, txt_path: str, target_size: float = 
     if len(predictions) == 0:
         return
 
-    # 3. 提取置信度最高的主目标 (此时 predictions 已经是纯粹的字典列表 [{...}, {...}])
-    best_instance = max(predictions, key=lambda x: x.get('bbox_score', 0))
+    # 3. 提取画面面积最大的主目标避开背景路人干扰 (此时 predictions 已经是字典列表 [{...}, {...}])
+    best_instance = max(predictions, key=get_box_area)
     
     keypoints = best_instance.get('keypoints', [])
     scores = best_instance.get('keypoint_scores', [])
@@ -164,14 +235,24 @@ def main():
         else:
             rel_path = os.path.relpath(img_path, input_root)
 
-        # 逐张推理，确保图像路径与结果严格一一对应
-        result = next(iter(inferencer(
-            img_path,
-            return_vis=True,
-            draw_heatmap=False,
-            black_background=args.black_bg,   # 由命令行参数控制
-            show=False
-        )))
+        # --- [精准检测框定轨法：强制单人提取] ---
+        # 1. 第一次快速推理：不开可视化，单纯为了获取所有人（包括干扰路人）的检测框
+        fast_result = next(iter(inferencer(img_path, return_vis=False, show=False)))
+        all_preds = fast_result.get('predictions', [])
+        
+        # MMPose 结果解包降维
+        if all_preds and isinstance(all_preds[0], list):
+            all_preds = all_preds[0]
+            
+        if all_preds:
+            # 2. 筛选出主目标单人：计算包围框面积，挑选在画面中绝对物理面积最大的主角
+            best_person = max(all_preds, key=get_box_area)
+
+            # 3. predictions 数据已是单人，直接用 first-pass 结果
+            result = fast_result
+            result['predictions'] = [[best_person]]
+        else:
+            result = fast_result
             
         # 拆分相对路径
         # rel_dir = 图像相对于 input_root 的子目录层级 (例如: 1.25/侧/rgb)
@@ -206,19 +287,13 @@ def main():
         # 这里的 args.size 就是原本 j2t.py 里面的 target_size
         extract_and_save_txt(predictions, out_txt_path, args.size)
 
-        # --- D. 透明 PNG 转换与渲染落盘 ---
-        vis_imgs = result.get('visualization', [])
-        if vis_imgs:
-            bgr_matrix = vis_imgs[0]
-            if args.black_bg:
-                # 黑底模式：去除黑色背景，生成透明 BGRA PNG
-                output_matrix = make_transparent_png(bgr_matrix)
-            else:
-                # 原始背景模式：直接保存带背景的骨架叠加图（BGR，无需转透明）
-                if bgr_matrix.dtype != np.uint8:
-                    bgr_matrix = (bgr_matrix * 255).clip(0, 255).astype(np.uint8)
-                output_matrix = bgr_matrix
-            cv2.imwrite(out_png_path, output_matrix)
+        # --- D. 手工绘制单人骨架 PNG（完全绕过 MMPose 内置渲染器，避免多人残影）---
+        predictions = result.get('predictions', [])
+        flat_preds = predictions[0] if predictions and isinstance(predictions[0], list) else predictions
+        if flat_preds:
+            img_bgr = cv2.imread(img_path)
+            skeleton_img = draw_skeleton_on_image(img_bgr, flat_preds[0], args.black_bg)
+            cv2.imwrite(out_png_path, skeleton_img)
 
     print("\n所有任务执行完毕，目录树结构及 txt 特征提取已成功同步。")
 
