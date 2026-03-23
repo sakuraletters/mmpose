@@ -32,6 +32,7 @@ dependencies:
   - xz-tools=5.8.2
   - zstd=1.5.7
   - pip:
+    - --extra-index-url https://download.pytorch.org/whl/cu121
     - addict==2.4.0
     - aliyun-python-sdk-core==2.16.0
     - aliyun-python-sdk-kms==2.16.5

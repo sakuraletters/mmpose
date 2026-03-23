@@ -1,4 +1,4 @@
-环境安装见 environment_mmpose.yml
+环境安装 mamba env create -f environment_mmpose.yml
 
 验证安装使用mim download mmpose --config td-hm_hrnet-w48_8xb32-210e_coco-256x192  --dest . 
     python demo/image_demo.py \
@@ -7,6 +7,8 @@
     td-hm_hrnet-w48_8xb32-210e_coco-256x192-0e67c616_20220913.pth \
     --out-file vis_results.jpg \
     --draw-heatmap
+质量筛选使用 sh quality.sh
+track_test是尝试使用该模型进行人物提取，但实测效果证明该模型不适合此工作，文件保留，但不使用该模型提取
 
 pose提取(json\txt\png三模态)。 sh pose.sh 内置路径修改
 
